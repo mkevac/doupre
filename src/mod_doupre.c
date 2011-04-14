@@ -3,11 +3,15 @@
 #include "http_protocol.h"
 #include "http_log.h"
 #include "ap_config.h"
+
+#include "apr.h"
 #include "apr_strings.h"
+
+#include "mod_micex_passport.h"
 
 #define MAX_SIZE 1024*1024*10
 
-static int get_data_from_POST(request_rec *r, char **buffer, apr_size_t *bsize)
+static int get_data_from_POST(request_rec * r, char **buffer, apr_size_t * bsize)
 {
         int bytes = 0;
         int eos = 0;
@@ -24,8 +28,7 @@ static int get_data_from_POST(request_rec *r, char **buffer, apr_size_t *bsize)
                         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Request too big (%d bytes; limit %d)", bytes, MAX_SIZE);
                         return HTTP_REQUEST_ENTITY_TOO_LARGE;
                 }
-        }
-        else {
+        } else {
                 bytes = MAX_SIZE;
         }
 
@@ -57,7 +60,7 @@ static int get_data_from_POST(request_rec *r, char **buffer, apr_size_t *bsize)
                         }
 
                         APR_BUCKET_REMOVE(b);
-                        APR_BRIGADE_INSERT_TAIL(bb,b);
+                        APR_BRIGADE_INSERT_TAIL(bb, b);
                         b = nextb;
                 }
         }
@@ -70,7 +73,7 @@ static int get_data_from_POST(request_rec *r, char **buffer, apr_size_t *bsize)
         }
 
         /* We've got all the data. Now put it in a buffer and parse it. */
-        buf = apr_palloc(r->pool, count+1);
+        buf = apr_palloc(r->pool, count + 1);
         rv = apr_brigade_flatten(bb, buf, &count);
         if (rv != APR_SUCCESS) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Error (flatten) reading form data");
@@ -84,7 +87,7 @@ static int get_data_from_POST(request_rec *r, char **buffer, apr_size_t *bsize)
         return OK;
 }
 
-static apr_table_t *parse_args(apr_pool_t *pool, const char *args)
+static apr_table_t *parse_args(apr_pool_t * pool, const char *args)
 {
         apr_table_t *rarray = NULL;
         char *tok, *val;
@@ -109,7 +112,7 @@ static apr_table_t *parse_args(apr_pool_t *pool, const char *args)
         return rarray;
 }
 
-static int get_method(request_rec *r, apr_table_t *args)
+static int get_method(request_rec * r, apr_table_t * args)
 {
         const char *amethod = NULL;
 
@@ -127,7 +130,7 @@ static int get_method(request_rec *r, apr_table_t *args)
         return r->method_number;
 }
 
-static char *get_key(request_rec *r)
+static char *get_key(request_rec * r)
 {
         char *slash = NULL;
 
@@ -138,77 +141,117 @@ static char *get_key(request_rec *r)
 
         slash++;
 
-        if (*slash == '\0')     {
+        if (*slash == '\0') {
                 return NULL;
         }
 
         return slash;
 }
 
-static int doupre_handler(request_rec *r)
+static int doupre_handler(request_rec * r)
 {
-    int my_method;
-    apr_table_t *my_args = NULL;
-    apr_size_t bsize = 0;
-    char *bdata = NULL;
-    int rv;
-    char *my_key = NULL;
+        int my_method;
+        apr_table_t *my_args = NULL;
+        apr_size_t bsize = 0;
+        char *bdata = NULL;
+        int rv;
+        char *my_key = NULL;
 
-    if (strcmp(r->handler, "doupre")) {
-        return DECLINED;
-    }
+        if (strcmp(r->handler, "doupre")) {
+                return DECLINED;
+        }
 
-    r->content_type = "text/html";      
+        r->content_type = "text/html";
 
-    my_args = parse_args(r->pool, r->args);
-    my_method = get_method(r, my_args);
-    my_key = get_key(r);
+        my_args = parse_args(r->pool, r->args);
+        my_method = get_method(r, my_args);
+        my_key = get_key(r);
 
-    if (!my_key) {
-            ap_rprintf(r, "No key selected.\n");
-            return HTTP_OK;
-    }
+        if (!my_key) {
+                ap_rprintf(r, "No key selected.\n");
+                return HTTP_OK;
+        }
 
-    if (my_method == M_POST) {
+        char *(*my_mp_get_cert) (request_rec *);
+        mp_cert_t *(*my_mp_cert_load) (request_rec *, char *);
 
-            rv = get_data_from_POST(r, &bdata, &bsize);
-            if (rv != OK) {
-                    return rv;
-            }
+        my_mp_get_cert = APR_RETRIEVE_OPTIONAL_FN(mp_get_cert);
+        if (!my_mp_get_cert) {
+                ap_rprintf(r, "Can't acquire certificate acquiring function.");
+                r->status = HTTP_INTERNAL_SERVER_ERROR;
+                return OK;
+        }
 
-            ap_rprintf(r, "Method POST.\n", my_key);
-            ap_rprintf(r, "Key '%s'\n", my_key);
-            ap_rprintf(r, "Size of POST data %"APR_SIZE_T_FMT" bytes.\n", bsize);
+        my_mp_cert_load = APR_RETRIEVE_OPTIONAL_FN(mp_cert_load);
+        if (!my_mp_cert_load) {
+                ap_rprintf(r, "Can't acquire certificate parsing function.");
+                r->status = HTTP_INTERNAL_SERVER_ERROR;
+                return OK;
+        }
 
-            return OK;
+        char *cert = NULL;
+        cert = my_mp_get_cert(r);
+        if (!cert) {
+                ap_rprintf(r, "User not authenticated.");
+                r->status = HTTP_UNAUTHORIZED;
+                return OK;
+        }
 
-    } else if (my_method == M_DELETE) {
-            ap_rprintf(r, "Method DELETE.\n", my_key);
-            ap_rprintf(r, "Key '%s'\n", my_key);
-            return OK;
-    } else if (my_method == M_GET) {
-            ap_rprintf(r, "Method GET.\n", my_key);
-            ap_rprintf(r, "Key '%s'\n", my_key);
-            return OK;
-    } else {
-            return HTTP_METHOD_NOT_ALLOWED;
-    }
+        ap_rprintf(r, "Cert is '%s'\n", cert);
 
-    return OK;
+        mp_cert_t *ocert = NULL;
+        ocert = my_mp_cert_load(r, cert);
+        if (!ocert) {
+                ap_rprintf(r, "Can't parse certificate");
+                r->status = HTTP_UNAUTHORIZED;
+                return OK;
+        }
+
+        char *my_full_key = NULL;
+        my_full_key = apr_psprintf(r->pool, "%s:%s", ocert->uid, my_key);
+
+        ap_rprintf(r, "User uid is %s\n", ocert->uid);
+        ap_rprintf(r, "Full key is %s\n", my_full_key);
+
+        if (my_method == M_POST) {
+
+                rv = get_data_from_POST(r, &bdata, &bsize);
+                if (rv != OK) {
+                        return rv;
+                }
+
+                ap_rprintf(r, "Method POST.\n", my_key);
+                ap_rprintf(r, "Key '%s'\n", my_key);
+                ap_rprintf(r, "Size of POST data %" APR_SIZE_T_FMT " bytes.\n", bsize);
+
+                return OK;
+
+        } else if (my_method == M_DELETE) {
+                ap_rprintf(r, "Method DELETE.\n", my_key);
+                ap_rprintf(r, "Key '%s'\n", my_key);
+                return OK;
+        } else if (my_method == M_GET) {
+                ap_rprintf(r, "Method GET.\n", my_key);
+                ap_rprintf(r, "Key '%s'\n", my_key);
+                return OK;
+        } else {
+                return HTTP_METHOD_NOT_ALLOWED;
+        }
+
+        return OK;
 }
 
-static void doupre_register_hooks(apr_pool_t *p)
+static void doupre_register_hooks(apr_pool_t * p)
 {
         ap_hook_handler(doupre_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
 module AP_MODULE_DECLARE_DATA doupre_module = {
-    STANDARD20_MODULE_STUFF, 
-    NULL,                  /* create per-dir    config structures */
-    NULL,                  /* merge  per-dir    config structures */
-    NULL,                  /* create per-server config structures */
-    NULL,                  /* merge  per-server config structures */
-    NULL,                  /* table of config file commands       */
-    doupre_register_hooks  /* register hooks                      */
+        STANDARD20_MODULE_STUFF,
+        NULL,                   /* create per-dir    config structures */
+        NULL,                   /* merge  per-dir    config structures */
+        NULL,                   /* create per-server config structures */
+        NULL,                   /* merge  per-server config structures */
+        NULL,                   /* table of config file commands       */
+        doupre_register_hooks   /* register hooks                      */
 };
-
