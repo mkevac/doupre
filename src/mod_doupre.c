@@ -9,7 +9,16 @@
 
 #include "mod_micex_passport.h"
 
+#include "../hiredis/hiredis.h"
+
 #define MAX_SIZE 1024*1024*10
+
+module AP_MODULE_DECLARE_DATA doupre_module;
+
+typedef struct {
+        const char *redis_server;
+        int redis_port;
+} doupre_server_cfg_t;
 
 static int get_data_from_POST(request_rec * r, char **buffer, apr_size_t * bsize)
 {
@@ -150,12 +159,14 @@ static char *get_key(request_rec * r)
 
 static int doupre_handler(request_rec * r)
 {
+        doupre_server_cfg_t *sconf = ap_get_module_config(r->server->module_config, &doupre_module);
         int my_method;
         apr_table_t *my_args = NULL;
         apr_size_t bsize = 0;
         char *bdata = NULL;
         int rv;
         char *my_key = NULL;
+        bool debug = false;
 
         if (strcmp(r->handler, "doupre")) {
                 return DECLINED;
@@ -167,6 +178,10 @@ static int doupre_handler(request_rec * r)
         my_method = get_method(r, my_args);
         my_key = get_key(r);
 
+        if (apr_table_get(my_args, "debug")) {
+                debug = true;
+        }
+
         if (!my_key) {
                 ap_rprintf(r, "No key selected.\n");
                 return HTTP_OK;
@@ -177,68 +192,196 @@ static int doupre_handler(request_rec * r)
 
         my_mp_get_cert = APR_RETRIEVE_OPTIONAL_FN(mp_get_cert);
         if (!my_mp_get_cert) {
-                ap_rprintf(r, "Can't acquire certificate acquiring function.");
-                r->status = HTTP_INTERNAL_SERVER_ERROR;
-                return OK;
+                if (debug) {
+                        ap_rprintf(r, "Can't acquire certificate acquiring function.");
+                        r->status = HTTP_INTERNAL_SERVER_ERROR;
+                        return OK;
+                } else {
+                        return HTTP_INTERNAL_SERVER_ERROR;
+                }
         }
 
         my_mp_cert_load = APR_RETRIEVE_OPTIONAL_FN(mp_cert_load);
         if (!my_mp_cert_load) {
-                ap_rprintf(r, "Can't acquire certificate parsing function.");
-                r->status = HTTP_INTERNAL_SERVER_ERROR;
-                return OK;
+                if (debug) {
+                        ap_rprintf(r, "Can't acquire certificate parsing function.");
+                        r->status = HTTP_INTERNAL_SERVER_ERROR;
+                        return OK;
+                } else {
+                        return HTTP_INTERNAL_SERVER_ERROR;
+                }
         }
 
         char *cert = NULL;
         cert = my_mp_get_cert(r);
         if (!cert) {
-                ap_rprintf(r, "User not authenticated.");
-                r->status = HTTP_UNAUTHORIZED;
-                return OK;
+                if (debug) {
+                        ap_rprintf(r, "User not authenticated.");
+                        r->status = HTTP_UNAUTHORIZED;
+                        return OK;
+                } else {
+                        return HTTP_UNAUTHORIZED;
+                }
         }
-
-        ap_rprintf(r, "Cert is '%s'\n", cert);
 
         mp_cert_t *ocert = NULL;
         ocert = my_mp_cert_load(r, cert);
         if (!ocert) {
-                ap_rprintf(r, "Can't parse certificate");
-                r->status = HTTP_UNAUTHORIZED;
-                return OK;
+                if (debug) {
+                        ap_rprintf(r, "Can't parse certificate");
+                        r->status = HTTP_UNAUTHORIZED;
+                        return OK;
+                } else {
+                        return HTTP_UNAUTHORIZED;
+                }
         }
 
         char *my_full_key = NULL;
         my_full_key = apr_psprintf(r->pool, "%s:%s", ocert->uid, my_key);
 
-        ap_rprintf(r, "User uid is %s\n", ocert->uid);
-        ap_rprintf(r, "Full key is %s\n", my_full_key);
+        struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+        redisContext *c = NULL;
+        c = redisConnectWithTimeout(sconf->redis_server, sconf->redis_port, timeout);
+        if (c->err) {
+                if (debug) {
+                        ap_rprintf(r, "Error: %s\n", c->errstr);
+                        r->status = HTTP_INTERNAL_SERVER_ERROR;
+                        return OK;
+                } else {
+                        return HTTP_INTERNAL_SERVER_ERROR;
+                }
+        }
+
+        redisReply *reply = NULL;
 
         if (my_method == M_POST) {
 
                 rv = get_data_from_POST(r, &bdata, &bsize);
                 if (rv != OK) {
-                        return rv;
+                        if (debug) {
+                                ap_rputs("Error while reading POST.\n", r);
+                                r->status = rv;
+                                return OK;
+                        } else {
+                                return rv;
+                        }
                 }
 
-                ap_rprintf(r, "Method POST.\n", my_key);
-                ap_rprintf(r, "Key '%s'\n", my_key);
-                ap_rprintf(r, "Size of POST data %" APR_SIZE_T_FMT " bytes.\n", bsize);
-
-                return OK;
+                reply = redisCommand(c, "SET %s %b", my_full_key, bdata, bsize);
+                if (!reply) {
+                        redisFree(c);
+                        if (debug) {
+                                ap_rprintf(r, "Error: %s\n", c->errstr);
+                                r->status = HTTP_INTERNAL_SERVER_ERROR;
+                                return OK;
+                        } else {
+                                return HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                }
 
         } else if (my_method == M_DELETE) {
-                ap_rprintf(r, "Method DELETE.\n", my_key);
-                ap_rprintf(r, "Key '%s'\n", my_key);
-                return OK;
+
+                reply = redisCommand(c, "DEL %s", my_full_key);
+                if (!reply) {
+                        redisFree(c);
+                        if (debug) {
+                                ap_rprintf(r, "Error: %s\n", c->errstr);
+                                r->status = HTTP_INTERNAL_SERVER_ERROR;
+                                return OK;
+                        } else {
+                                return HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                }
+
         } else if (my_method == M_GET) {
-                ap_rprintf(r, "Method GET.\n", my_key);
-                ap_rprintf(r, "Key '%s'\n", my_key);
-                return OK;
+
+                reply = redisCommand(c, "GET %s", my_full_key);
+                if (!reply) {
+                        redisFree(c);
+                        if (debug) {
+                                ap_rprintf(r, "Error: %s\n", c->errstr);
+                                r->status = HTTP_INTERNAL_SERVER_ERROR;
+                                return OK;
+                        } else {
+                                return HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                }
+
+                if (reply->type == REDIS_REPLY_STRING) {
+                        ap_rputs(reply->str, r);
+                }
+
         } else {
+                redisFree(c);
                 return HTTP_METHOD_NOT_ALLOWED;
         }
 
+        if (reply->type == REDIS_REPLY_STATUS) {
+                if (debug) {
+                        ap_rputs(reply->str, r);
+                }
+        }
+
+        if (reply->type == REDIS_REPLY_NIL) {
+                redisFree(c);
+                return HTTP_NOT_FOUND;
+        }
+
+        if (reply->type == REDIS_REPLY_ERROR) {
+                redisFree(c);
+                if (debug) {
+                        ap_rputs(reply->str, r);
+                        r->status = HTTP_INTERNAL_SERVER_ERROR;
+                        return OK;
+                } else {
+                        return HTTP_INTERNAL_SERVER_ERROR;
+                }
+        }
+
+        redisFree(c);
+
         return OK;
+}
+
+typedef enum {
+        cmd_redis_server,
+        cmd_redis_port
+} cmd_parts;
+
+static const char *doupre_cmd_args(cmd_parms * cmd, void *dconf, const char *val)
+{
+        doupre_server_cfg_t *sconf = ap_get_module_config(cmd->server->module_config, &doupre_module);
+
+        switch ((long)cmd->info) {
+        case cmd_redis_server:
+                sconf->redis_server = val;
+                break;
+        case cmd_redis_port:
+                sconf->redis_port = atoi(val);
+                break;
+        }
+
+        return NULL;
+}
+
+static void *doupre_server_config_create(apr_pool_t * p, server_rec * s)
+{
+        doupre_server_cfg_t *sconf = apr_pcalloc(p, sizeof(*sconf));
+        sconf->redis_server = "localhost";
+        sconf->redis_port = 6379;
+        return sconf;
+}
+
+static void *doupre_server_config_merge(apr_pool_t * p, void *basev, void *overridesv)
+{
+        doupre_server_cfg_t *ps = apr_pcalloc(p, sizeof(*ps));
+        doupre_server_cfg_t *base = basev;
+        doupre_server_cfg_t *overrides = overridesv;
+
+        ps->redis_server = !apr_strnatcmp(base->redis_server, overrides->redis_server) ? base->redis_server : overrides->redis_server;
+        ps->redis_port = base->redis_port == overrides->redis_port ? base->redis_port : overrides->redis_port;
+
+        return ps;
 }
 
 static void doupre_register_hooks(apr_pool_t * p)
@@ -246,12 +389,18 @@ static void doupre_register_hooks(apr_pool_t * p)
         ap_hook_handler(doupre_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
+static const command_rec doupre_cmds[] = {
+        AP_INIT_TAKE1("DoupreRedisServer", doupre_cmd_args, (void *)cmd_redis_server, RSRC_CONF, "Redis server hostname or ip"),
+        AP_INIT_TAKE1("DoupreRedisPort", doupre_cmd_args, (void *)cmd_redis_port, RSRC_CONF, "Redis port"),
+        {NULL}
+};
+
 module AP_MODULE_DECLARE_DATA doupre_module = {
         STANDARD20_MODULE_STUFF,
         NULL,                   /* create per-dir    config structures */
         NULL,                   /* merge  per-dir    config structures */
-        NULL,                   /* create per-server config structures */
-        NULL,                   /* merge  per-server config structures */
-        NULL,                   /* table of config file commands       */
+        doupre_server_config_create,    /* create per-server config structures */
+        doupre_server_config_merge,     /* merge  per-server config structures */
+        doupre_cmds,            /* table of config file commands       */
         doupre_register_hooks   /* register hooks                      */
 };
