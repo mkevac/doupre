@@ -1,6 +1,6 @@
 all:
 	cd hiredis; make static; cd ..;
-	apxs -c -i -A src/mod_doupre.c
+	apxs -c -i -A src/mod_doupre.c hiredis/libhiredis.a
 
 clean:
 	cd hiredis; make clean; cd ..;
