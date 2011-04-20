@@ -16,8 +16,10 @@
 module AP_MODULE_DECLARE_DATA doupre_module;
 
 typedef struct {
-        const char *redis_server;
-        int redis_port;
+        const char *redis_read_server;
+        const char *redis_write_server;
+        int redis_read_port;
+        int redis_write_port;
 } doupre_server_cfg_t;
 
 static int get_data_from_POST(request_rec * r, char **buffer, apr_size_t * bsize)
@@ -241,7 +243,13 @@ static int doupre_handler(request_rec * r)
 
         struct timeval timeout = { 1, 500000 }; // 1.5 seconds
         redisContext *c = NULL;
-        c = redisConnectWithTimeout(sconf->redis_server, sconf->redis_port, timeout);
+
+        if (my_method == M_POST || my_method == M_DELETE) {
+                c = redisConnectWithTimeout(sconf->redis_write_server, sconf->redis_write_port, timeout);
+        } else {
+                c = redisConnectWithTimeout(sconf->redis_read_server, sconf->redis_read_port, timeout);
+        }
+
         if (c->err) {
                 if (debug) {
                         ap_rprintf(r, "Error: %s\n", c->errstr);
@@ -344,8 +352,10 @@ static int doupre_handler(request_rec * r)
 }
 
 typedef enum {
-        cmd_redis_server,
-        cmd_redis_port
+        cmd_redis_read_server,
+        cmd_redis_read_port,
+        cmd_redis_write_server,
+        cmd_redis_write_port
 } cmd_parts;
 
 static const char *doupre_cmd_args(cmd_parms * cmd, void *dconf, const char *val)
@@ -353,11 +363,17 @@ static const char *doupre_cmd_args(cmd_parms * cmd, void *dconf, const char *val
         doupre_server_cfg_t *sconf = ap_get_module_config(cmd->server->module_config, &doupre_module);
 
         switch ((long)cmd->info) {
-        case cmd_redis_server:
-                sconf->redis_server = val;
+        case cmd_redis_read_server:
+                sconf->redis_read_server = val;
                 break;
-        case cmd_redis_port:
-                sconf->redis_port = atoi(val);
+        case cmd_redis_write_server:
+                sconf->redis_write_server = val;
+                break;
+        case cmd_redis_read_port:
+                sconf->redis_read_port = atoi(val);
+                break;
+        case cmd_redis_write_port:
+                sconf->redis_write_port = atoi(val);
                 break;
         }
 
@@ -367,8 +383,10 @@ static const char *doupre_cmd_args(cmd_parms * cmd, void *dconf, const char *val
 static void *doupre_server_config_create(apr_pool_t * p, server_rec * s)
 {
         doupre_server_cfg_t *sconf = apr_pcalloc(p, sizeof(*sconf));
-        sconf->redis_server = "localhost";
-        sconf->redis_port = 6379;
+        sconf->redis_read_server = "localhost";
+        sconf->redis_write_server = "localhost";
+        sconf->redis_read_port = 6379;
+        sconf->redis_write_port = 6379;
         return sconf;
 }
 
@@ -378,8 +396,10 @@ static void *doupre_server_config_merge(apr_pool_t * p, void *basev, void *overr
         doupre_server_cfg_t *base = basev;
         doupre_server_cfg_t *overrides = overridesv;
 
-        ps->redis_server = !apr_strnatcmp(base->redis_server, overrides->redis_server) ? base->redis_server : overrides->redis_server;
-        ps->redis_port = base->redis_port == overrides->redis_port ? base->redis_port : overrides->redis_port;
+        ps->redis_read_server = !apr_strnatcmp(base->redis_read_server, overrides->redis_read_server) ? base->redis_read_server : overrides->redis_read_server;
+        ps->redis_write_server = !apr_strnatcmp(base->redis_write_server, overrides->redis_write_server) ? base->redis_write_server : overrides->redis_write_server;
+        ps->redis_read_port = base->redis_read_port == overrides->redis_read_port ? base->redis_read_port : overrides->redis_read_port;
+        ps->redis_write_port = base->redis_write_port == overrides->redis_write_port ? base->redis_write_port : overrides->redis_write_port;
 
         return ps;
 }
@@ -390,8 +410,10 @@ static void doupre_register_hooks(apr_pool_t * p)
 }
 
 static const command_rec doupre_cmds[] = {
-        AP_INIT_TAKE1("DoupreRedisServer", doupre_cmd_args, (void *)cmd_redis_server, RSRC_CONF, "Redis server hostname or ip"),
-        AP_INIT_TAKE1("DoupreRedisPort", doupre_cmd_args, (void *)cmd_redis_port, RSRC_CONF, "Redis port"),
+        AP_INIT_TAKE1("DoupreRedisWriteServer", doupre_cmd_args, (void *)cmd_redis_write_server, RSRC_CONF, ""),
+        AP_INIT_TAKE1("DoupreRedisWritePort", doupre_cmd_args, (void *)cmd_redis_write_port, RSRC_CONF, ""),
+        AP_INIT_TAKE1("DoupreRedisReadServer", doupre_cmd_args, (void *)cmd_redis_read_server, RSRC_CONF, ""),
+        AP_INIT_TAKE1("DoupreRedisReadPort", doupre_cmd_args, (void *)cmd_redis_read_port, RSRC_CONF, ""),
         {NULL}
 };
 
