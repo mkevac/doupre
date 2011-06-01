@@ -349,11 +349,12 @@ static char *encode_string(apr_pool_t *p, const char *buf)
         int i, j;
 
         for (i = 0, j = 0; i < buf_len; i++) {
-                if (buf[i] < 0x0f) {
+                uint8_t b = buf[i];
+                if (b < 0x0f) {
                         res[j++] = 0x01;
-                        res[j++] = buf[i] + 0x40;
+                        res[j++] = b + 0x40;
                 } else {
-                        res[j++] = buf[i];
+                        res[j++] = b;
                 }
         }
         return res;
@@ -366,10 +367,11 @@ static char *decode_string(apr_pool_t *p, const char *buf)
         int i, j;
 
         for (i = 0, j = 0; i < buf_len; i++) {
-                if (buf[i] == 0x01) {
-                        res[j++] = buf[++i] - 0x40;
+                uint8_t b = buf[i];
+                if (b == 0x01) {
+                        res[j++] = b - 0x40;
                 } else {
-                        res[j++] = buf[i];
+                        res[j++] = b;
                 }
         }
         res[j] = '\0';
