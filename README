@@ -1,0 +1,4 @@
+doupre is apache module which allows acquiring, storing and modifying data
+in MySQL database via HandlerSocket MySQL API (NoSQL API).
+
+doupre is using REST.
